@@ -124,6 +124,11 @@
   .txn-cat { font-weight: 700; font-size: 15px; }
   .txn-note { color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .txn-date { color: var(--muted); font-size: 12px; margin-top: 1px; }
+  .src {
+    display: inline-block; font-size: 10px; font-weight: 700; color: var(--accent);
+    background: rgba(56,189,248,0.12); border: 1px solid rgba(56,189,248,0.35);
+    border-radius: 6px; padding: 1px 7px; margin-left: 7px; vertical-align: 1px;
+  }
   .txn-amt { font-weight: 800; font-size: 15px; white-space: nowrap; }
   .in { color: var(--green); } .out { color: var(--red); }
   .empty { text-align: center; color: var(--muted); padding: 26px 0; font-size: 14px; }
@@ -267,11 +272,13 @@
 
   <div class="card">
     <h2>Settings</h2>
-    <div class="set-row"><span>Monthly budget (Rs)</span><input id="budgetInput" type="number" inputmode="decimal" min="0" placeholder="0"></div>
+    <div class="set-row"><span>Monthly budget (Rs)</span><input id="budgetInput" type="text" inputmode="decimal" placeholder="0"></div>
     <div class="set-row"><span>Export backup file</span><button class="btn" id="exportBtn">Export</button></div>
     <div class="set-row"><span>Import backup file</span><button class="btn" id="importBtn">Import</button></div>
+    <div class="set-row"><span>Import bank / eSewa statement</span><button class="btn" id="stmtBtn">Choose file</button></div>
     <div class="set-row"><span>Erase all data</span><button class="btn danger" id="resetBtn">Reset</button></div>
     <input type="file" id="importFile" accept=".json,application/json" style="display:none">
+    <input type="file" id="stmtFile" accept=".xlsx,.xls,.csv" style="display:none">
   </div>
 
   <div class="foot">Works fully offline · your data never leaves this phone<br>Tip: Add to Home Screen for an app-like experience</div>
@@ -288,7 +295,7 @@
     <button id="btnIncome">Income</button>
   </div>
   <div class="amt-prefix">AMOUNT (RS)</div>
-  <input class="amt-input" id="amount" type="number" inputmode="decimal" min="0" step="any" placeholder="0">
+  <input class="amt-input" id="amount" type="text" inputmode="decimal" enterkeyhint="done" autocomplete="off" placeholder="0">
   <label>Category</label>
   <div class="chips" id="chips"></div>
   <label for="note">Note</label>
@@ -434,7 +441,7 @@
     $("formErr").classList.remove("show");
     $("backdrop").classList.add("open");
     $("sheet").classList.add("open");
-    setTimeout(function () { $("amount").focus(); }, 350);
+    setTimeout(function () { $("amount").focus(); }, 450);
   }
   function closeSheet() {
     $("backdrop").classList.remove("open");
@@ -675,7 +682,7 @@
         '<div class="txn-info">' +
           '<div class="txn-cat">' + esc(t.category) + "</div>" +
           (t.note ? '<div class="txn-note">' + esc(t.note) + "</div>" : "") +
-          '<div class="txn-date">' + esc(t.date) + "</div>" +
+          '<div class="txn-date">' + esc(t.date) + (t.source ? '<span class="src">' + esc(t.source) + "</span>" : "") + "</div>" +
         "</div>" +
         '<div class="txn-amt ' + (t.type === "income" ? "in" : "out") + '">' +
           (t.type === "income" ? "+" : "−") + esc(fmt(t.amount)) +
@@ -684,6 +691,423 @@
       box.appendChild(row);
     });
   }
+
+  // ---- Statement import: offline parsers (no libraries) ----
+  //__PARSERS_START__
+  // Everything between the markers is pure logic (no DOM access) so the
+  // same code can be executed under Node for automated testing.
+
+  function inflateRaw(u8) {
+    var src = new ReadableStream({
+      start: function (c) { c.enqueue(u8); c.close(); }
+    });
+    return new Response(src.pipeThrough(new DecompressionStream("deflate-raw")))
+      .arrayBuffer().then(function (b) { return new Uint8Array(b); });
+  }
+
+  function zipEntries(u8) {
+    var dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    function u32(o) { return dv.getUint32(o, true); }
+    function u16(o) { return dv.getUint16(o, true); }
+    var eocd = -1;
+    for (var i = u8.length - 22; i >= 0; i--) {
+      if (u32(i) === 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd < 0) throw new Error("not a zip file");
+    var count = u16(eocd + 10), cdOff = u32(eocd + 16);
+    var entries = {}, p = cdOff, dec = new TextDecoder();
+    for (var n = 0; n < count; n++) {
+      if (u32(p) !== 0x02014b50) throw new Error("bad zip directory");
+      var method = u16(p + 10), csize = u32(p + 20);
+      var nameLen = u16(p + 28), extraLen = u16(p + 30), comLen = u16(p + 32);
+      var lhOff = u32(p + 42);
+      entries[dec.decode(u8.subarray(p + 46, p + 46 + nameLen))] = { method: method, csize: csize, lhOff: lhOff };
+      p += 46 + nameLen + extraLen + comLen;
+    }
+    return { entries: entries, data: u8 };
+  }
+
+  function zipRead(zip, name) {
+    var e = zip.entries[name];
+    if (!e) return Promise.reject(new Error("missing " + name));
+    var dv = new DataView(zip.data.buffer, zip.data.byteOffset, zip.data.byteLength);
+    var p = e.lhOff;
+    if (dv.getUint32(p, true) !== 0x04034b50) return Promise.reject(new Error("bad zip entry"));
+    var nameLen = dv.getUint16(p + 26, true), extraLen = dv.getUint16(p + 28, true);
+    var raw = zip.data.subarray(p + 30 + nameLen + extraLen, p + 30 + nameLen + extraLen + e.csize);
+    if (e.method === 0) return Promise.resolve(raw);
+    if (e.method === 8) return inflateRaw(raw);
+    return Promise.reject(new Error("unsupported zip method"));
+  }
+
+  function parseXmlDoc(text) {
+    var doc = new DOMParser().parseFromString(text, "text/xml");
+    if (doc.getElementsByTagName("parsererror").length) throw new Error("bad xml");
+    return doc;
+  }
+
+  function sheetToRows(xmlText, sst) {
+    var doc = parseXmlDoc(xmlText);
+    var rows = [];
+    var rowEls = doc.getElementsByTagName("row");
+    for (var i = 0; i < rowEls.length; i++) {
+      var rn = rowEls[i], rNum = parseInt(rn.getAttribute("r"), 10) || (rows.length + 1);
+      while (rows.length < rNum) rows.push([]);
+      var row = rows[rNum - 1];
+      var cells = rn.getElementsByTagName("c");
+      for (var j = 0; j < cells.length; j++) {
+        var c = cells[j], ref = c.getAttribute("r") || "";
+        var m = /^([A-Z]+)/.exec(ref), col = 0;
+        if (m) { for (var k = 0; k < m[1].length; k++) col = col * 26 + (m[1].charCodeAt(k) - 64); }
+        col -= 1;
+        var t = c.getAttribute("t"), v = null;
+        var vEls = c.getElementsByTagName("v");
+        var raw = vEls.length ? vEls[0].textContent : null;
+        if (t === "s") v = raw == null ? null : sst[parseInt(raw, 10)];
+        else if (t === "inlineStr") { var isEl = c.getElementsByTagName("is")[0]; v = isEl ? isEl.textContent : null; }
+        else if (t === "str") v = raw;
+        else if (t === "b") v = raw === "1";
+        else if (raw == null || t === "e") v = null;
+        else { var n = parseFloat(raw); v = isNaN(n) ? raw : n; }
+        if (col >= 0) { while (row.length <= col) row.push(null); row[col] = v; }
+      }
+    }
+    return rows;
+  }
+
+  function parseXLSX(u8) {
+    var zip = zipEntries(u8), dec = new TextDecoder();
+    function txt(name) { return zipRead(zip, name).then(function (b) { return dec.decode(b); }); }
+    return txt("xl/workbook.xml").then(function (wxml) {
+      var wdoc = parseXmlDoc(wxml);
+      var sheetEls = wdoc.getElementsByTagName("sheet");
+      return txt("xl/_rels/workbook.xml.rels").then(function (rxml) {
+        var rdoc = parseXmlDoc(rxml);
+        var rels = {}, rn = rdoc.getElementsByTagName("Relationship");
+        for (var j = 0; j < rn.length; j++) {
+          var id = rn[j].getAttribute("Id"), tgt = rn[j].getAttribute("Target");
+          if (id && tgt) rels[id] = tgt;
+        }
+        var order = [];
+        for (var k = 0; k < sheetEls.length; k++) {
+          var rid = sheetEls[k].getAttribute("r:id") || sheetEls[k].getAttribute("id");
+          var t = rels[rid];
+          if (t) order.push({ name: sheetEls[k].getAttribute("name"), path: "xl/" + t.replace(/^(\.\.\/)+/, "") });
+        }
+        var pick = null;
+        order.forEach(function (o) { if (!pick && /statement/i.test(o.name || "")) pick = o; });
+        var target = pick || order[0];
+        if (!target) {
+          var keys = Object.keys(zip.entries);
+          for (var q = 0; q < keys.length; q++) {
+            if (/xl\/worksheets\/[^\/]+\.xml$/.test(keys[q])) { target = { path: keys[q] }; break; }
+          }
+        }
+        if (!target) throw new Error("no worksheet found");
+        var sstP = zip.entries["xl/sharedStrings.xml"]
+          ? txt("xl/sharedStrings.xml").then(function (sxml) {
+              var sdoc = parseXmlDoc(sxml), out = [], sis = sdoc.getElementsByTagName("si");
+              for (var s = 0; s < sis.length; s++) {
+                var ts = sis[s].getElementsByTagName("t"), str = "";
+                for (var w = 0; w < ts.length; w++) str += ts[w].textContent;
+                out.push(str);
+              }
+              return out;
+            })
+          : Promise.resolve([]);
+        return sstP.then(function (sst) {
+          return txt(target.path).then(function (sxml) { return sheetToRows(sxml, sst); });
+        });
+      });
+    });
+  }
+
+  // ---- Legacy .xls: minimal OLE2 + BIFF8 reader ----
+  function oleReadChain(u8, fat, sectorSize, start) {
+    var parts = [], sec = start, guard = 0;
+    while (sec !== 0xFFFFFFFE && sec < 0xFFFFFFFC && guard++ < 200000) {
+      // sector N starts after the 512-byte file header
+      parts.push(u8.subarray((sec + 1) * sectorSize, (sec + 1) * sectorSize + sectorSize));
+      sec = fat[sec];
+    }
+    var total = 0, i;
+    for (i = 0; i < parts.length; i++) total += parts[i].length;
+    var res = new Uint8Array(total), o = 0;
+    for (i = 0; i < parts.length; i++) { res.set(parts[i], o); o += parts[i].length; }
+    return res;
+  }
+
+  function parseOLE(u8) {
+    var sig = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1], i;
+    for (i = 0; i < 8; i++) if (u8[i] !== sig[i]) throw new Error("not an OLE file");
+    var dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    function u16(o) { return dv.getUint16(o, true); }
+    function u32(o) { return dv.getUint32(o, true); }
+    var sectorSize = 1 << u16(30);
+    var fatSectors = u32(44), dirStart = u32(48);
+    var fat = [];
+    for (var s = 0; s < fatSectors; s++) {
+      var fatSec = u32(76 + s * 4);
+      for (var k = 0; k < sectorSize / 4; k++) fat.push(u32((fatSec + 1) * sectorSize + k * 4));
+    }
+    var dirBytes = oleReadChain(u8, fat, sectorSize, dirStart);
+    var dd = new DataView(dirBytes.buffer, dirBytes.byteOffset, dirBytes.byteLength);
+    var wbStart = -1, wbSize = 0;
+    for (var d = 0; d + 128 <= dirBytes.length; d += 128) {
+      var nm = "";
+      for (var q = 0; q < 32; q++) { var ch = dd.getUint16(d + q * 2, true); if (!ch) break; nm += String.fromCharCode(ch); }
+      if (dirBytes[d + 66] === 2 && (nm === "Workbook" || nm === "Book")) {
+        wbStart = dd.getUint32(d + 116, true);
+        wbSize = dd.getUint32(d + 120, true);
+        break;
+      }
+    }
+    if (wbStart < 0) throw new Error("no Workbook stream");
+    if (wbSize < 4096) throw new Error("unexpected small Workbook stream");
+    return oleReadChain(u8, fat, sectorSize, wbStart).subarray(0, wbSize);
+  }
+
+  function rkToNum(rk) {
+    var v = Math.floor(rk / 4);
+    if (rk & 2) return v / 100;
+    if (rk & 1) {
+      var buf = new ArrayBuffer(8), dd = new DataView(buf);
+      dd.setUint32(0, (rk - (rk % 4)) >>> 0, false);
+      dd.setUint32(4, 0, false);
+      return dd.getFloat64(0, false);
+    }
+    if (v >= 0x20000000) v -= 0x40000000;
+    return v;
+  }
+
+  function parseSST(chunks) {
+    var ci = 0, p = 8, curWide = false;
+    function getByte() {
+      if (p >= chunks[ci].length) {
+        ci++;
+        if (ci >= chunks.length) throw new Error("sst overrun");
+        p = 1; // skip the continuation flag byte
+        curWide = (chunks[ci][0] & 1) === 1;
+      }
+      return chunks[ci][p++];
+    }
+    function getU16() { var a = getByte(), b = getByte(); return a | (b << 8); }
+    function getU32() {
+      var a = getByte(), b = getByte(), c = getByte(), d = getByte();
+      return (a | (b << 8) | (c << 16)) + d * 16777216;
+    }
+    var c0 = chunks[0];
+    var unique = (c0[4] | (c0[5] << 8) | (c0[6] << 16)) + c0[7] * 16777216;
+    var strs = [];
+    for (var s = 0; s < unique; s++) {
+      var cch = getU16(), grbit = getByte();
+      curWide = (grbit & 1) === 1;
+      var runs = (grbit & 8) ? getU16() : 0;
+      var extLen = (grbit & 4) ? getU32() : 0;
+      var str = "";
+      for (var k = 0; k < cch; k++) str += curWide ? String.fromCharCode(getU16()) : String.fromCharCode(getByte());
+      for (var r = 0; r < runs; r++) { getU16(); getU16(); }
+      for (var e = 0; e < extLen; e++) getByte();
+      strs.push(str);
+    }
+    return strs;
+  }
+
+  function parseBIFF(wb) {
+    var dv = new DataView(wb.buffer, wb.byteOffset, wb.byteLength);
+    function u16(o) { return dv.getUint16(o, true); }
+    var recs = [], p = 0;
+    // NOTE: a .xls Workbook holds several substreams (globals, then one per
+    // sheet), each terminated by EOF -- so scan the whole stream, not just
+    // up to the first EOF.
+    while (p + 4 <= wb.length) {
+      var id = u16(p), len = u16(p + 2);
+      recs.push({ id: id, data: wb.subarray(p + 4, p + 4 + len) });
+      p += 4 + len;
+    }
+    var sstChunks = [];
+    for (var i = 0; i < recs.length; i++) {
+      if (recs[i].id === 0x00FC) {
+        sstChunks.push(recs[i].data);
+        var j = i + 1;
+        while (j < recs.length && recs[j].id === 0x003C) { sstChunks.push(recs[j].data); j++; }
+        break;
+      }
+    }
+    var sst = sstChunks.length ? parseSST(sstChunks) : [];
+    var cells = {};
+    function setC(r, c, v) { cells[r + "," + c] = v; }
+    function uniStr(d, o) {
+      var len = d[o] | (d[o + 1] << 8), wide = d[o + 2] & 1, s = "", q = o + 3;
+      for (var k = 0; k < len; k++) {
+        s += wide ? String.fromCharCode(d[q] | (d[q + 1] << 8)) : String.fromCharCode(d[q]);
+        q += wide ? 2 : 1;
+      }
+      return s;
+    }
+    for (var n = 0; n < recs.length; n++) {
+      var r = recs[n], d = r.data;
+      var dd = new DataView(d.buffer, d.byteOffset, d.byteLength);
+      function g16(o) { return dd.getUint16(o, true); }
+      function g32(o) { return dd.getUint32(o, true); }
+      if (r.id === 0x00FD && d.length >= 10) setC(g16(0), g16(2), sst[g32(6)]);
+      else if (r.id === 0x0203 && d.length >= 14) setC(g16(0), g16(2), dd.getFloat64(6, true));
+      else if (r.id === 0x027E && d.length >= 10) setC(g16(0), g16(2), rkToNum(g32(6)));
+      else if (r.id === 0x00BD && d.length >= 8) {
+        var mr = g16(0), c0 = g16(2), cols = (d.length - 6) / 6;
+        for (var k2 = 0; k2 < cols; k2++) setC(mr, c0 + k2, rkToNum(g32(4 + k2 * 6 + 2)));
+      }
+      else if (r.id === 0x0204 && d.length >= 9) {
+        var lr = g16(0), lc = g16(2), llen = g16(6), lwide = d[8] & 1, ls = "", lq = 9;
+        for (var q2 = 0; q2 < llen; q2++) {
+          ls += lwide ? String.fromCharCode(d[lq] | (d[lq + 1] << 8)) : String.fromCharCode(d[lq]);
+          lq += lwide ? 2 : 1;
+        }
+        setC(lr, lc, ls);
+      }
+      else if (r.id === 0x0006 && d.length >= 16) {
+        var fr = g16(0), fc = g16(2), isStr = true;
+        for (var b = 6; b < 14; b++) if (d[b] !== 0xFF) { isStr = false; break; }
+        if (isStr && n + 1 < recs.length && recs[n + 1].id === 0x0207) setC(fr, fc, uniStr(recs[n + 1].data, 0));
+        else if (!isStr) setC(fr, fc, dd.getFloat64(6, true));
+      }
+    }
+    var maxR = -1, maxC = -1, k;
+    for (k in cells) { var rc = k.split(","); maxR = Math.max(maxR, +rc[0]); maxC = Math.max(maxC, +rc[1]); }
+    var rows = [];
+    for (var rr = 0; rr <= maxR; rr++) {
+      var row = [];
+      for (var cc = 0; cc <= maxC; cc++) row.push(cells[rr + "," + cc] === undefined ? null : cells[rr + "," + cc]);
+      rows.push(row);
+    }
+    return rows;
+  }
+
+  function rowsFromXLS(u8) { return parseBIFF(parseOLE(u8)); }
+
+  function parseCSV(text) {
+    var rows = [], row = [], field = "", quoted = false;
+    for (var i = 0; i < text.length; i++) {
+      var c = text[i];
+      if (quoted) {
+        if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else quoted = false; }
+        else field += c;
+      } else if (c === '"') quoted = true;
+      else if (c === ",") { row.push(field); field = ""; }
+      else if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+      else if (c !== "\r") field += c;
+    }
+    row.push(field); rows.push(row);
+    return rows;
+  }
+
+  function detectStatementProfile(rows) {
+    for (var i = 0; i < Math.min(rows.length, 20); i++) {
+      var cells = rows[i].map(function (c) { return String(c == null ? "" : c).toLowerCase().trim(); });
+      function at(name) { return cells.indexOf(name); }
+      if (at("transaction date") !== -1 && at("withdraw") !== -1 && at("deposit") !== -1) {
+        return { kind: "bank", header: i, date: at("transaction date"), note: at("description"), out: at("withdraw"), inc: at("deposit") };
+      }
+      if (at("date time") !== -1 && at("dr.") !== -1 && at("cr.") !== -1) {
+        return { kind: "esewa", header: i, date: at("date time"), note: at("description"), out: at("dr."), inc: at("cr.") };
+      }
+    }
+    return null;
+  }
+
+  function detectGenericProfile(rows) {
+    for (var i = 0; i < Math.min(rows.length, 20); i++) {
+      var cells = rows[i].map(function (c) { return String(c == null ? "" : c).toLowerCase().trim(); });
+      function find(re) { for (var k = 0; k < cells.length; k++) if (re.test(cells[k])) return k; return -1; }
+      var di = find(/date/), ai = find(/amount|^amt$/);
+      if (di !== -1 && ai !== -1) {
+        return { kind: "generic", header: i, date: di, note: find(/descrip|narration|particular|detail|remark|memo/), out: -1, inc: -1, amount: ai, typeCol: find(/type|cr\/?dr|debit\/?credit/) };
+      }
+    }
+    return null;
+  }
+
+  function okDate(y, m, d) {
+    if (!(y >= 1990 && y <= 2100 && m >= 1 && m <= 12 && d >= 1 && d <= 31)) return null;
+    return y + "-" + pad(m) + "-" + pad(d);
+  }
+
+  function parseStatementDate(v) {
+    if (v == null || v === "") return null;
+    if (typeof v === "number" && isFinite(v)) {
+      var d = new Date(Math.round((v - 25569) * 86400000));
+      return okDate(d.getFullYear(), d.getMonth() + 1, d.getDate());
+    }
+    var s = String(v).trim(), m;
+    if ((m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s))) return okDate(+m[1], +m[2], +m[3]);
+    if ((m = /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/.exec(s))) {
+      var y = m[3].length === 2 ? 2000 + (+m[3]) : +m[3];
+      return okDate(y, +m[2], +m[1]);
+    }
+    var t = Date.parse(s);
+    if (!isNaN(t)) { var d2 = new Date(t); return okDate(d2.getFullYear(), d2.getMonth() + 1, d2.getDate()); }
+    return null;
+  }
+
+  function parseStatementAmount(v) {
+    if (v == null || v === "") return 0;
+    if (typeof v === "number" && isFinite(v)) return Math.round(v * 100) / 100;
+    var n = parseFloat(String(v).replace(/,/g, "").replace(/[^\d.\-]/g, ""));
+    return isNaN(n) ? 0 : Math.round(n * 100) / 100;
+  }
+
+  function guessCategory(desc, type) {
+    var d = String(desc || "").toLowerCase();
+    if (type === "income") {
+      if (/salary|payroll/.test(d)) return "Salary";
+      if (/freelance|upwork|fiverr/.test(d)) return "Freelance";
+      if (/interest|dividend/.test(d)) return "Business";
+      return "Other";
+    }
+    if (/restaurant|food|cafe|momo|bakery|pizza|burger|kitchen|bhoj|sweets/.test(d)) return "Food";
+    if (/bus|taxi|pathao|indrive|petrol|fuel|yatayat|parking/.test(d)) return "Transport";
+    if (/electricity|nea|khanepani|internet|wifi|recharge|topup|ntc|ncell|dishhome|bill/.test(d)) return "Bills";
+    if (/hospital|pharmacy|clinic|doctor|medicine|lab/.test(d)) return "Health";
+    if (/school|college|course|book|tuition|exam/.test(d)) return "Education";
+    if (/movie|cinema|game/.test(d)) return "Entertainment";
+    if (/daraz|shop|store|mart|purchase/.test(d)) return "Shopping";
+    return "Other";
+  }
+
+  function mkImportTxn(type, amount, note, date, source) {
+    return {
+      id: "t" + Date.now() + Math.floor(Math.random() * 100000),
+      type: type, amount: amount, category: guessCategory(note, type),
+      note: note, date: date, createdAt: Date.now(), source: source
+    };
+  }
+
+  function rowsToTxns(rows, prof) {
+    var out = [], srcName = prof.kind === "bank" ? "Bank" : prof.kind === "esewa" ? "eSewa" : "File";
+    for (var i = prof.header + 1; i < rows.length; i++) {
+      var r = rows[i];
+      var date = parseStatementDate(r[prof.date]);
+      if (!date) continue;
+      var note = prof.note !== -1 && r[prof.note] != null ? String(r[prof.note]).trim().slice(0, 80) : "";
+      if (prof.kind === "generic") {
+        var amt = parseStatementAmount(r[prof.amount]);
+        if (!(amt > 0) && !(amt < 0)) continue;
+        var type = amt < 0 ? "expense" : "income";
+        if (prof.typeCol !== -1 && r[prof.typeCol] != null) {
+          var tv = String(r[prof.typeCol]).toLowerCase().trim();
+          if (/^(dr|debit|withdraw)/.test(tv)) type = "expense";
+          else if (/^(cr|credit|deposit)/.test(tv)) type = "income";
+        }
+        out.push(mkImportTxn(type, Math.abs(amt), note, date, srcName));
+      } else {
+        var w = parseStatementAmount(r[prof.out]), dep = parseStatementAmount(r[prof.inc]);
+        if (w > 0) out.push(mkImportTxn("expense", w, note, date, srcName));
+        if (dep > 0) out.push(mkImportTxn("income", dep, note, date, srcName));
+      }
+    }
+    return out;
+  }
+  //__PARSERS_END__
 
   // ---- Backup / settings ----
   function exportBackup() {
@@ -726,6 +1150,46 @@
       } catch (e) { toast("Couldn't read that file"); }
     };
     reader.readAsText(file);
+  }
+
+  function importStatementFile(file) {
+    toast("Reading file…");
+    var reader = new FileReader();
+    reader.onload = function () {
+      var buf = new Uint8Array(reader.result || []);
+      var name = (file.name || "").toLowerCase();
+      var parsed;
+      if (/\.csv$/.test(name)) {
+        parsed = Promise.resolve(parseCSV(new TextDecoder().decode(buf)));
+      } else if (/\.xls$/.test(name) && !/\.xlsx$/.test(name) && buf[0] === 0xD0 && buf[1] === 0xCF) {
+        parsed = Promise.resolve().then(function () { return rowsFromXLS(buf); });
+      } else {
+        parsed = Promise.resolve().then(function () { return parseXLSX(buf); });
+      }
+      parsed.then(function (rows) {
+        var prof = detectStatementProfile(rows) || detectGenericProfile(rows);
+        if (!prof) { toast("Couldn't recognize this statement"); return; }
+        var made = rowsToTxns(rows, prof);
+        if (!made.length) { toast("No transactions found in file"); return; }
+        var seen = {};
+        load().forEach(function (t) { seen[t.date + "|" + t.type + "|" + t.amount + "|" + (t.note || "")] = 1; });
+        var fresh = made.filter(function (t) { return !seen[t.date + "|" + t.type + "|" + t.amount + "|" + (t.note || "")]; });
+        var skipped = made.length - fresh.length;
+        if (!fresh.length) { toast("All of these are already imported"); return; }
+        var inc = fresh.filter(function (t) { return t.type === "income"; }).length;
+        if (!confirm("Import " + fresh.length + " transactions (" + inc + " income, " + (fresh.length - inc) + " expenses)" + (skipped ? ", skipping " + skipped + " duplicates" : "") + "?")) return;
+        var txns = load();
+        fresh.forEach(function (t) { txns.push(t); });
+        save(txns);
+        var newest = fresh.map(function (t) { return t.date; }).sort().pop();
+        state.viewYear = parseInt(newest.slice(0, 4), 10);
+        state.viewMonth = parseInt(newest.slice(5, 7), 10) - 1;
+        render();
+        toast("Imported " + fresh.length + " transactions");
+      }).catch(function () { toast("Couldn't read that file"); });
+    };
+    reader.onerror = function () { toast("Couldn't read that file"); };
+    reader.readAsArrayBuffer(file);
   }
 
   // ---- Init ----
@@ -791,6 +1255,11 @@
   $("importBtn").onclick = function () { $("importFile").click(); };
   $("importFile").onchange = function (e) {
     if (e.target.files[0]) importBackup(e.target.files[0]);
+    e.target.value = "";
+  };
+  $("stmtBtn").onclick = function () { $("stmtFile").click(); };
+  $("stmtFile").onchange = function (e) {
+    if (e.target.files[0]) importStatementFile(e.target.files[0]);
     e.target.value = "";
   };
   $("resetBtn").onclick = function () {
